@@ -36,10 +36,64 @@ type Connection struct {
 	connectTimeout time.Duration
 	opts           []grpc.DialOption
 
-	id            int
-	status        uint32
-	idleSettingTp int64
-	grpcConn      *grpc.ClientConn
+	id                 int
+	status             uint32
+	idleSettingMilliTp int64
+	grpcConn           *grpc.ClientConn
+}
+
+func (t *Connection) GetId() int {
+	return t.id
+}
+
+func (t *Connection) GetStatus() uint32 {
+	return t.status
+}
+
+func (t *Connection) GetStatusDesc() string {
+	return define.GetConnStatusDesc(t.status)
+}
+
+func (t *Connection) setStatusStatus(status uint32) {
+	if status == define.ConnStatusIdle {
+		t.idleSettingMilliTp = time.Now().UnixMilli()
+	}
+	t.status = status
+}
+
+func (t *Connection) GetTarget() string {
+	return t.target
+}
+
+func (t *Connection) GetGRPCConn() *grpc.ClientConn {
+	return t.grpcConn
+}
+
+func (t *Connection) GetIdleSettingMilliTimestamp() int64 {
+	return t.idleSettingMilliTp
+}
+
+func (t *Connection) GetGRPCConnStatus() connectivity.State {
+	if t.grpcConn == nil {
+		return connectivity.State(define.GRPCConnStatusInvalid)
+	}
+
+	return t.grpcConn.GetState()
+}
+
+func (t *Connection) stop() {
+	// Force the status to ConnStatusStopped
+	t.status = define.ConnStatusStopped
+
+	grpcConn := t.grpcConn
+	if grpcConn != nil {
+		if err := grpcConn.Close(); err != nil {
+			logger.GetLoggerInstance().WarningF("Closing GRPC connection failed when stopping the connection. Id: %v, Err: %v",
+				t.id, err)
+		}
+	}
+
+	t.opts = []grpc.DialOption{}
 }
 
 func (t *Connection) create() error {
@@ -73,28 +127,8 @@ func (t *Connection) connect() (retSuccess bool, retErr error) {
 	return
 }
 
-func (t *Connection) GetStatus() uint32 {
-	return t.status
-}
-
-func (t *Connection) setStatusStatus(status uint32) {
-	if status == define.ConnStatusIdle {
-		t.idleSettingTp = time.Now().Unix()
-	}
-	t.status = status
-
-}
-
 func (t *Connection) IsIdleStatus() bool {
 	return t.grpcConn != nil && t.status == define.ConnStatusIdle
-}
-
-func (t *Connection) GetGRPCConn() *grpc.ClientConn {
-	return t.grpcConn
-}
-
-func (t *Connection) GetIdleSettingTimestamp() int64 {
-	return t.idleSettingTp
 }
 
 func (t *Connection) updateStatus() {

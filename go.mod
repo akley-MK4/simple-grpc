@@ -1,6 +1,6 @@
 module github.com/akley-MK4/simple-grpc
 
-go 1.18
+go 1.19
 
 require google.golang.org/grpc v1.59.0
 

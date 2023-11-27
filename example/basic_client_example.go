@@ -6,6 +6,7 @@ import (
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"math/rand"
 	"time"
 )
 
@@ -37,6 +38,7 @@ func RunBasicClientExample() error {
 		MinIdleConnNum: minIdleConnNum,
 		//MaxIdleDurationMilli: 100 * 60,
 		MaxIdleDurationMilli: maxIdleDurationMilli,
+		KeepActiveInterval:   time.Second * time.Duration(5),
 	}
 
 	kw.DialOpts = append(kw.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -51,6 +53,20 @@ func RunBasicClientExample() error {
 	}
 
 	clientConnPool = connPool
+	go func() {
+		for {
+			time.Sleep(time.Second * 20)
+			touchConnPoolShrink()
+		}
+	}()
+
+	go func() {
+		for {
+			time.Sleep(time.Second * 3)
+			logger.GetLoggerInstance().DebugF("Available Connections Num: %d", connPool.GetAvailableConnectionsNum())
+		}
+	}()
+	time.Sleep(time.Hour)
 
 	go func() {
 		for {
@@ -87,10 +103,15 @@ func RunBasicClientExample() error {
 
 func touchConnPoolShrink() {
 	var connList []*connectionpool.Connection
-	for i := 0; i < maxConnNum; i++ {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	num := r.Intn(maxConnNum) + 1
+	for i := 0; i < num; i++ {
 		conn, _, preemptErr := getClientConnPool().PreemptConnection()
 		if preemptErr != nil {
 			logger.GetLoggerInstance().WarningF("Failed to preempt connection, Err: %v", preemptErr)
+			continue
+		}
+		if conn == nil {
 			continue
 		}
 		connList = append(connList, conn)
@@ -104,4 +125,7 @@ func touchConnPoolShrink() {
 		}
 	}
 
+	if len(connList) > 0 {
+		logger.GetLoggerInstance().DebugF("Successfully preempted %d connections", len(connList))
+	}
 }

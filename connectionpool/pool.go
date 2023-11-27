@@ -7,6 +7,7 @@ import (
 	"github.com/akley-MK4/simple-grpc/define"
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"time"
 )
 
@@ -21,12 +22,13 @@ type KwArgsNewConnPool struct {
 	MaxConnNum           uint16
 	MinIdleConnNum       uint16
 	MaxIdleDurationMilli uint64
+	KeepActiveInterval   time.Duration
 }
 
 func NewConnectionPool(kw KwArgsNewConnPool) (*ConnectionPool, error) {
 	// check parameters
 	if kw.Target == "" || len(kw.DialOpts) <= 0 || kw.MaxConnNum <= 0 || kw.MinIdleConnNum > kw.MaxConnNum ||
-		kw.MaxIdleDurationMilli <= 0 || kw.NewConnTimeout <= 0 {
+		kw.MaxIdleDurationMilli <= 0 || kw.NewConnTimeout <= 0 || kw.KeepActiveInterval <= 0 {
 		return nil, errors.New("there are invalid parameters")
 	}
 
@@ -50,13 +52,13 @@ func NewConnectionPool(kw KwArgsNewConnPool) (*ConnectionPool, error) {
 			conn.GetId(), conn.GetTarget(), conn.GetStatusDesc(), conn.GetGRPCConnStatus())
 	}
 
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 	connPool := &ConnectionPool{
-		kw:         &kw,
-		connList:   connList,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
+		kw:       &kw,
+		connList: connList,
 	}
+	connPool.shrinkCancelCtx, connPool.shrinkCancelFunc = context.WithCancel(context.Background())
+	connPool.keepActiveCtx, connPool.keepActiveCancelFunc = context.WithCancel(context.Background())
+
 	connPool.preemptFns = []PreemptFuncType{
 		connPool.preemptIdleConn,
 		connPool.preemptCreatedConn,
@@ -75,14 +77,17 @@ type ConnectionPool struct {
 
 	preemptFns []PreemptFuncType
 
-	cancelFunc context.CancelFunc
-	cancelCtx  context.Context
-	started    bool
+	shrinkCancelFunc     context.CancelFunc
+	shrinkCancelCtx      context.Context
+	keepActiveCancelFunc context.CancelFunc
+	keepActiveCtx        context.Context
+	started              bool
 }
 
 func (t *ConnectionPool) Start() error {
 	t.started = true
 	go t.checkAndShrinkPeriodically()
+	go t.checkAndKeepActivePeriodically()
 	return nil
 }
 
@@ -91,7 +96,8 @@ func (t *ConnectionPool) Stop() {
 		return
 	}
 
-	t.cancelFunc()
+	t.shrinkCancelFunc()
+	t.keepActiveCancelFunc()
 
 	for _, conn := range t.GetConnections() {
 		conn.stop()
@@ -102,6 +108,64 @@ func (t *ConnectionPool) Stop() {
 
 func (t *ConnectionPool) GetConnections() []*Connection {
 	return t.connList
+}
+
+func (t *ConnectionPool) checkAndKeepActivePeriodically() {
+	logger.GetLoggerInstance().Debug("Start periodic activate GRPC connection pool")
+	timer := time.NewTicker(t.kw.KeepActiveInterval)
+
+loopEnd:
+	for {
+		select {
+		case <-timer.C:
+			if !t.checkAndKeepActive() {
+				break loopEnd
+			}
+			break
+		case <-t.keepActiveCtx.Done():
+			break loopEnd
+		}
+	}
+
+	timer.Stop()
+	logger.GetLoggerInstance().Debug("Stop periodic activate GRPC connection pool")
+}
+
+func (t *ConnectionPool) checkAndKeepActive() bool {
+	var nowActiveConnCount uint16
+	for _, conn := range t.GetConnections() {
+		if conn.GetGRPCConnStatus() == connectivity.Ready {
+			nowActiveConnCount++
+		}
+	}
+
+	if nowActiveConnCount >= t.kw.MinIdleConnNum {
+		return true
+	}
+
+	preemptFunc := []PreemptFuncType{
+		t.preemptCreatedConn,
+		t.preemptNotCreateConn,
+	}
+
+	var keepActivatedCount int
+	for i := 0; i < int(t.kw.MinIdleConnNum-nowActiveConnCount); i++ {
+		for _, fn := range preemptFunc {
+			activeConn, activeErr := fn()
+			if activeConn == nil || activeErr != nil {
+				continue
+			}
+			keepActivatedCount++
+			_ = t.RecycleConnection(activeConn)
+			break
+		}
+	}
+
+	if keepActivatedCount > 0 {
+		logger.GetLoggerInstance().DebugF("Keep %d connections active", keepActivatedCount)
+	}
+
+	return true
 }
 
 func (t *ConnectionPool) checkAndShrinkPeriodically() {
@@ -116,7 +180,7 @@ loopEnd:
 				break loopEnd
 			}
 			break
-		case <-t.cancelCtx.Done():
+		case <-t.shrinkCancelCtx.Done():
 			break loopEnd
 		}
 	}
@@ -132,6 +196,10 @@ func (t *ConnectionPool) checkAndShrink() bool {
 	for _, conn := range t.GetConnections() {
 		connTp := conn.GetIdleSettingMilliTimestamp()
 		if conn.GetStatus() != define.ConnStatusIdle || connTp <= 0 || nowTp <= connTp {
+			continue
+		}
+
+		if conn.GetGRPCConnStatus() != connectivity.Ready {
 			continue
 		}
 
@@ -227,6 +295,16 @@ func (t *ConnectionPool) preemptCreatedConn() (retConn *Connection, retErr error
 		if success {
 			retConn = conn
 			return
+		}
+	}
+
+	return
+}
+
+func (t *ConnectionPool) GetAvailableConnectionsNum() (retNum int) {
+	for _, conn := range t.GetConnections() {
+		if conn.GetGRPCConnStatus() == connectivity.Ready {
+			retNum++
 		}
 	}
 

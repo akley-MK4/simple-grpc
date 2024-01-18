@@ -3,6 +3,7 @@ package connectionpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/akley-MK4/simple-grpc/define"
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
@@ -18,13 +19,19 @@ const (
 	maxAttemptWaitGRPCConnStatusNum  = 2
 )
 
-func newConnection(id int, target string, opts []grpc.DialOption, connectTimeout time.Duration) *Connection {
+var (
+	incConnId uint64
+)
+
+type connSwitchToBusyUsingStatusFunc func() (switched bool, retErr error)
+
+func newConnection(target string, opts []grpc.DialOption, connectTimeout time.Duration) *Connection {
 	conn := &Connection{
 		target:         target,
 		connectTimeout: connectTimeout,
 		opts:           opts,
-		id:             id,
-		status:         define.ConnStatusNotCreate,
+		id:             atomic.AddUint64(&incConnId, 1),
+		usingStatus:    define.NotOpenUsingStatus,
 		grpcConn:       nil,
 	}
 
@@ -36,29 +43,29 @@ type Connection struct {
 	connectTimeout time.Duration
 	opts           []grpc.DialOption
 
-	id                 int
-	status             uint32
-	idleSettingMilliTp int64
-	grpcConn           *grpc.ClientConn
+	id           uint64
+	usingStatus  uintptr
+	idledMilliTp int64
+	grpcConn     *grpc.ClientConn
 }
 
-func (t *Connection) GetId() int {
+func (t *Connection) GetId() uint64 {
 	return t.id
 }
 
-func (t *Connection) GetStatus() uint32 {
-	return t.status
+func (t *Connection) GetUsingStatus() uintptr {
+	return t.usingStatus
 }
 
-func (t *Connection) GetStatusDesc() string {
-	return define.GetConnStatusDesc(t.status)
+func (t *Connection) GetUsingStatusDesc() string {
+	return define.GetUsingStatusDesc(t.usingStatus)
 }
 
-func (t *Connection) setStatusStatus(status uint32) {
-	if status == define.ConnStatusIdle {
-		t.idleSettingMilliTp = time.Now().UnixMilli()
+func (t *Connection) setUsingStatus(status uintptr) {
+	if status == define.IdledUsingStatus {
+		t.idledMilliTp = time.Now().UnixMilli()
 	}
-	t.status = status
+	t.usingStatus = status
 }
 
 func (t *Connection) GetTarget() string {
@@ -69,11 +76,11 @@ func (t *Connection) GetGRPCConn() *grpc.ClientConn {
 	return t.grpcConn
 }
 
-func (t *Connection) GetIdleSettingMilliTimestamp() int64 {
-	return t.idleSettingMilliTp
+func (t *Connection) GetIdledMilliTimestamp() int64 {
+	return t.idledMilliTp
 }
 
-func (t *Connection) GetGRPCConnStatus() connectivity.State {
+func (t *Connection) GetConnStatus() connectivity.State {
 	if t.grpcConn == nil {
 		return connectivity.State(define.GRPCConnStatusInvalid)
 	}
@@ -81,22 +88,33 @@ func (t *Connection) GetGRPCConnStatus() connectivity.State {
 	return t.grpcConn.GetState()
 }
 
-func (t *Connection) stop() {
-	// Force the status to ConnStatusStopped
-	t.status = define.ConnStatusStopped
+func (t *Connection) stop() error {
+	switchedStatus := false
+	for _, oldStatus := range prioritySwitchFromStatusListToStopping {
+		if atomic.CompareAndSwapUintptr(&t.usingStatus, oldStatus, define.StoppingUsingStatus) {
+			switchedStatus = true
+			break
+		}
+	}
+
+	if !switchedStatus {
+		return fmt.Errorf("current using status is %v and cannot be closed", t.usingStatus)
+	}
 
 	grpcConn := t.grpcConn
 	if grpcConn != nil {
 		if err := grpcConn.Close(); err != nil {
-			logger.GetLoggerInstance().WarningF("Closing GRPC connection failed when stopping the connection. Id: %v, Err: %v",
+			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, Id: %v, Err: %v",
 				t.id, err)
 		}
 	}
 
+	t.usingStatus = define.StoppedUsingStatus
 	t.opts = []grpc.DialOption{}
+	return nil
 }
 
-func (t *Connection) create() error {
+func (t *Connection) open() error {
 	ctx, cancel := context.WithTimeout(context.Background(), t.connectTimeout)
 	defer cancel()
 
@@ -127,22 +145,22 @@ func (t *Connection) connect() (retSuccess bool, retErr error) {
 	return
 }
 
-func (t *Connection) IsIdleStatus() bool {
-	return t.grpcConn != nil && t.status == define.ConnStatusIdle
+func (t *Connection) IsIdleUsingStatus() bool {
+	return t.grpcConn != nil && t.usingStatus == define.IdledUsingStatus
 }
 
-func (t *Connection) updateStatus() {
+func (t *Connection) updateUsingStatus() {
 	grpcConn := t.grpcConn
 	if grpcConn == nil {
-		t.setStatusStatus(define.ConnStatusNotCreate)
+		t.setUsingStatus(define.NotOpenUsingStatus)
 		return
 	}
 
 	if grpcConn.GetState() == connectivity.Ready {
-		t.setStatusStatus(define.ConnStatusIdle)
+		t.setUsingStatus(define.IdledUsingStatus)
 		return
 	}
-	t.setStatusStatus(define.ConnStatusCreated)
+	t.setUsingStatus(define.DisconnectedUsingStatus)
 }
 
 func (t *Connection) checkAndWaitForGRPCConnReady() bool {
@@ -171,67 +189,75 @@ func (t *Connection) waitForGrpcConnReady() bool {
 	return t.grpcConn.GetState() == connectivity.Ready
 }
 
-func (t *Connection) switchFromIdleToBusyStatus() (retSuccess bool, retErr error) {
-	if !atomic.CompareAndSwapUint32(&t.status, define.ConnStatusIdle, define.ConnStatusBusy) {
+func (t *Connection) switchFromIdleToBusyUsingStatus() (switched bool, retErr error) {
+	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.IdledUsingStatus, define.BusyUsingStatus) {
 		return
 	}
 
-	if t.checkAndWaitForGRPCConnReady() {
-		retSuccess = true
+	if t.grpcConn == nil {
+		t.usingStatus = define.NotOpenUsingStatus
+		retErr = errors.New("no gRPC connection opened")
 		return
 	}
 
-	t.status = define.ConnStatusCreated
-	retSuccess = false
+	switched = t.checkAndWaitForGRPCConnReady()
+	if !switched {
+		t.usingStatus = define.DisconnectedUsingStatus
+	}
+
 	return
 }
 
-func (t *Connection) switchFromNotCreateToBusyStatus() (retSuccess bool, retErr error) {
-	if !atomic.CompareAndSwapUint32(&t.status, define.ConnStatusNotCreate, define.ConnStatusBusy) {
+func (t *Connection) switchFromNotOpenToBusyUsingStatus() (switched bool, retErr error) {
+	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.NotOpenUsingStatus, define.BusyUsingStatus) {
 		return
 	}
 
-	if err := t.create(); err != nil {
-		t.status = define.ConnStatusNotCreate
+	if err := t.open(); err != nil {
+		t.usingStatus = define.NotOpenUsingStatus
 		retErr = err
 		return
 	}
 
-	if t.checkAndWaitForGRPCConnReady() {
-		retSuccess = true
-		return
+	switched = t.checkAndWaitForGRPCConnReady()
+	if !switched {
+		t.usingStatus = define.DisconnectedUsingStatus
 	}
 
-	t.status = define.ConnStatusCreated
 	return
 }
 
-func (t *Connection) switchFromCreatedToBusyStatus() (retSuccess bool, retErr error) {
-	if !atomic.CompareAndSwapUint32(&t.status, define.ConnStatusCreated, define.ConnStatusBusy) {
+func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (switched bool, retErr error) {
+	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.DisconnectedUsingStatus, define.BusyUsingStatus) {
 		return
 	}
 
-	if t.checkAndWaitForGRPCConnReady() {
-		retSuccess = true
+	if t.grpcConn == nil {
+		t.usingStatus = define.NotOpenUsingStatus
+		retErr = errors.New("no gRPC connection opened")
 		return
 	}
 
-	t.status = define.ConnStatusCreated
+	switched = t.checkAndWaitForGRPCConnReady()
+	if !switched {
+		t.usingStatus = define.DisconnectedUsingStatus
+	}
+
 	return
 }
 
-func (t *Connection) switchFromIdleToNotCreateStatus() {
-	if !atomic.CompareAndSwapUint32(&t.status, define.ConnStatusIdle, define.ConnStatusClosing) {
-		return
+func (t *Connection) switchFromIdledToNotOpenUsingStatus() bool {
+	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.IdledUsingStatus, define.ClosingUsingStatus) {
+		return false
 	}
 
-	go func() {
-		if err := t.grpcConn.Close(); err != nil {
-			logger.GetLoggerInstance().WarningF("Failed to close GRPC connection, %v", err)
-		}
-		t.grpcConn = nil
-		t.status = define.ConnStatusNotCreate
-	}()
+	if err := t.grpcConn.Close(); err != nil {
+		logger.GetLoggerInstance().WarningF("Failed to close a GRPC connection, Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v",
+			t.GetId(), t.GetTarget(), t.GetUsingStatusDesc(), t.grpcConn.GetState(), err)
+	}
 
-	return
+	t.grpcConn = nil
+	t.usingStatus = define.NotOpenUsingStatus
+
+	return true
 }

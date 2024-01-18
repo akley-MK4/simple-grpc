@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	maxWorkerNum            = 10
-	maxConnNum              = 100
-	minIdleConnNum          = 20
-	maxIdleDurationMilli    = 1000 * 10
-	idledConnNumIntervalSec = 5
+	maxWorkerNum                = 10
+	maxConnNum                  = 100
+	minIdleConnNum              = 20
+	maxIdleDurationMilliseconds = 1000 * 10
+	idledConnNumIntervalSec     = 5
 )
 
 var (
@@ -41,8 +41,8 @@ func RunBasicClientExample() error {
 		MaxConnNum:      maxConnNum,
 		MinIdledConnNum: minIdleConnNum,
 		//MaxIdleDurationMilli: 100 * 60,
-		MaxIdledDurationMilli: maxIdleDurationMilli,
-		IdledConnNumInterval:  time.Second * time.Duration(idledConnNumIntervalSec),
+		MaxIdledDurationMilliseconds: maxIdleDurationMilliseconds,
+		CheckIdledConnNumInterval:    time.Second * time.Duration(idledConnNumIntervalSec),
 	}
 
 	kw.DialOpts = append(kw.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -164,7 +164,7 @@ func testMaxAllocateAndRecycleConnections() error {
 
 func testShrinkAndKeepMinIdledConnections() error {
 	logger.GetLoggerInstance().Info("Wait for shrink")
-	time.Sleep(time.Millisecond*maxIdleDurationMilli + time.Second*10)
+	time.Sleep(time.Millisecond*maxIdleDurationMilliseconds + time.Second*10)
 
 	count := getConnPoolInst().GetConnectionsCount()
 	if count != maxConnNum {
@@ -218,7 +218,7 @@ func testShrinkAndKeepMinIdledConnections() error {
 	}
 
 	logger.GetLoggerInstance().Info("Wait for shrink")
-	time.Sleep(time.Millisecond*maxIdleDurationMilli + time.Second*10)
+	time.Sleep(time.Millisecond*maxIdleDurationMilliseconds + time.Second*10)
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
 	if count != minIdleConnNum {
 		return fmt.Errorf("[10] current number of idled using status connections is incorrect, %d != %d", count, minIdleConnNum)

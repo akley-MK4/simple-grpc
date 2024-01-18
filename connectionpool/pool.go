@@ -39,16 +39,16 @@ type KwArgsConnPool struct {
 
 	NewConnTimeout time.Duration
 
-	MaxConnNum            int
-	MinIdledConnNum       int
-	MaxIdledDurationMilli uint64
-	IdledConnNumInterval  time.Duration
+	MaxConnNum                   int
+	MinIdledConnNum              int
+	MaxIdledDurationMilliseconds uint64
+	CheckIdledConnNumInterval    time.Duration
 }
 
 func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 	// check parameters
 	if kw.Target == "" || len(kw.DialOpts) <= 0 || kw.MaxConnNum <= 0 || kw.MinIdledConnNum > kw.MaxConnNum ||
-		kw.MaxIdledDurationMilli <= 0 || kw.NewConnTimeout <= 0 || kw.IdledConnNumInterval <= 0 {
+		kw.MaxIdledDurationMilliseconds <= 0 || kw.NewConnTimeout <= 0 || kw.CheckIdledConnNumInterval <= 0 {
 		return nil, errors.New("invalid parameters")
 	}
 
@@ -205,7 +205,7 @@ func (t *ConnectionPool) GetUsingStatusConnectionsCount(usingStatus uintptr) (re
 
 func (t *ConnectionPool) checkAndAddIdledConnectionsPeriodically() {
 	logger.GetLoggerInstance().Debug("Started periodic check and add the gRPC connections of the idled status")
-	timer := time.NewTicker(t.kw.IdledConnNumInterval)
+	timer := time.NewTicker(t.kw.CheckIdledConnNumInterval)
 
 loopEnd:
 	for {
@@ -265,7 +265,7 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 
 func (t *ConnectionPool) checkAndShrinkIdledConnectionsPeriodically() {
 	logger.GetLoggerInstance().Debug("Started periodic check and shrink the gRPC connections of the idled status")
-	timer := time.NewTicker(time.Millisecond * time.Duration(t.kw.MaxIdledDurationMilli))
+	timer := time.NewTicker(time.Millisecond * time.Duration(t.kw.MaxIdledDurationMilliseconds))
 
 loopEnd:
 	for {
@@ -298,7 +298,7 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 			continue
 		}
 
-		if uint64(nowTp-idledTp) >= t.kw.MaxIdledDurationMilli {
+		if uint64(nowTp-idledTp) >= t.kw.MaxIdledDurationMilliseconds {
 			expiredConnList.PushBack(conn)
 		}
 	}

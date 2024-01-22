@@ -17,6 +17,8 @@ const (
 
 	onceAttemptWaitGRPCConnStatusSec = 3
 	maxAttemptWaitGRPCConnStatusNum  = 2
+
+	checkStatusTimeAfterConnect = time.Millisecond * 200
 )
 
 var (
@@ -104,8 +106,8 @@ func (t *Connection) stop() error {
 	grpcConn := t.grpcConn
 	if grpcConn != nil {
 		if err := grpcConn.Close(); err != nil {
-			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, Id: %v, Err: %v",
-				t.id, err)
+			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
+				t.GetId(), t.GetTarget(), t.GetUsingStatusDesc(), grpcConn.GetState(), err)
 		}
 	}
 
@@ -135,7 +137,7 @@ func (t *Connection) connect() (retSuccess bool, retErr error) {
 
 	for i := 0; i < maxRetryConnectNum; i++ {
 		t.grpcConn.Connect()
-		time.Sleep(time.Second)
+		time.Sleep(checkStatusTimeAfterConnect)
 		if t.grpcConn.GetState() == connectivity.Ready {
 			retSuccess = true
 			return
@@ -149,7 +151,7 @@ func (t *Connection) IsIdleUsingStatus() bool {
 	return t.grpcConn != nil && t.usingStatus == define.IdledUsingStatus
 }
 
-func (t *Connection) updateUsingStatus() {
+func (t *Connection) updateUsingStatus() (switchedIdledStatus bool) {
 	grpcConn := t.grpcConn
 	if grpcConn == nil {
 		t.setUsingStatus(define.NotOpenUsingStatus)
@@ -158,9 +160,12 @@ func (t *Connection) updateUsingStatus() {
 
 	if grpcConn.GetState() == connectivity.Ready {
 		t.setUsingStatus(define.IdledUsingStatus)
+		switchedIdledStatus = true
 		return
 	}
+
 	t.setUsingStatus(define.DisconnectedUsingStatus)
+	return
 }
 
 func (t *Connection) checkAndWaitForGRPCConnReady() bool {

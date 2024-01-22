@@ -82,9 +82,10 @@ func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 
 	logger.GetLoggerInstance().DebugF("Successfully created %d ready gRPC connections", readyConnCount)
 	connPool := &ConnectionPool{
-		kw:       &kw,
-		connList: connList,
-		status:   define.InitializedPoolStatus,
+		kw:             &kw,
+		connList:       connList,
+		status:         define.InitializedPoolStatus,
+		idledConnCount: int32(readyConnCount),
 	}
 	connPool.shrinkCancelCtx, connPool.shrinkCancelFunc = context.WithCancel(context.Background())
 	connPool.keepActiveCtx, connPool.keepActiveCancelFunc = context.WithCancel(context.Background())
@@ -104,10 +105,21 @@ type ConnectionPool struct {
 	shrinkCancelCtx      context.Context
 	keepActiveCancelFunc context.CancelFunc
 	keepActiveCtx        context.Context
+
+	idledConnCount int32
+	busyConnCount  int32
 }
 
 func (t *ConnectionPool) GetStatus() uintptr {
 	return t.status
+}
+
+func (t *ConnectionPool) GetIdledConnectionsCount() int32 {
+	return t.idledConnCount
+}
+
+func (t *ConnectionPool) GetBusyConnectionsCount() int32 {
+	return t.busyConnCount
 }
 
 func (t *ConnectionPool) Start() error {
@@ -132,7 +144,8 @@ func (t *ConnectionPool) Stop(disableClean bool) error {
 
 	for _, conn := range t.getConnections() {
 		if err := conn.stop(); err != nil {
-			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, ")
+			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
+				conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), err)
 		}
 	}
 
@@ -150,11 +163,34 @@ func (t *ConnectionPool) AllocateConnection() (retConn *Connection, retErr error
 		return
 	}
 
+	if int(atomic.LoadInt32(&t.busyConnCount)) >= t.kw.MaxConnNum {
+		retErr = define.ErrorReachedMaxConnNumLimit
+		return
+	}
+
+	defer func() {
+		if retErr == nil && retConn != nil {
+			atomic.AddInt32(&t.busyConnCount, 1)
+		}
+	}()
+
 	for _, oldStatus := range prioritySwitchFromStatusListToBusy {
-		retConn, retErr = allocateConnectionByUsingStatus(oldStatus, t.getConnections())
-		if retErr != nil || retConn != nil {
+		if oldStatus == define.IdledUsingStatus && atomic.LoadInt32(&t.idledConnCount) <= 0 {
+			continue
+		}
+
+		retConn, retErr = t.allocateConnectionByUsingStatus(oldStatus, t.getConnections())
+		if retErr != nil {
 			return
 		}
+		if retConn == nil {
+			continue
+		}
+
+		if oldStatus == define.IdledUsingStatus {
+			atomic.AddInt32(&t.idledConnCount, -1)
+		}
+		return
 	}
 
 	retConn, retErr = t.allocateNewConnection()
@@ -173,7 +209,10 @@ func (t *ConnectionPool) RecycleConnection(conn *Connection) error {
 	//	return fmt.Errorf("wrong using status %v", conn.GetUsingStatus())
 	//}
 
-	conn.updateUsingStatus()
+	if conn.updateUsingStatus() {
+		atomic.AddInt32(&t.idledConnCount, 1)
+	}
+	atomic.AddInt32(&t.busyConnCount, -1)
 	return nil
 }
 
@@ -237,7 +276,7 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 
 	for i := 0; i < t.kw.MinIdledConnNum-idledCount; i++ {
 		for _, oldStatus := range prioritySwitchFromStatusListToIdle {
-			conn, errSwitch := allocateConnectionByUsingStatus(oldStatus, t.getConnections())
+			conn, errSwitch := t.allocateConnectionByUsingStatus(oldStatus, t.getConnections())
 			if errSwitch != nil {
 				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, unable to switch to the correct using status, "+
 					"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
@@ -248,6 +287,7 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 				continue
 			}
 
+			atomic.AddInt32(&t.busyConnCount, 1)
 			// switch to idle status
 			if err := t.RecycleConnection(conn); err != nil {
 				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, unable to recycle the connection, "+
@@ -321,6 +361,7 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 			defer wg.Done()
 
 			if conn.switchFromIdledToNotOpenUsingStatus() {
+				atomic.AddInt32(&t.idledConnCount, -1)
 				atomic.AddUint64(&closedCount, 1)
 			}
 		}(conn, &wg)
@@ -331,7 +372,7 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 	return
 }
 
-func allocateConnectionByUsingStatus(oldStatus uintptr, connList []*Connection) (retConn *Connection, retErr error) {
+func (t *ConnectionPool) allocateConnectionByUsingStatus(oldStatus uintptr, connList []*Connection) (retConn *Connection, retErr error) {
 	for _, conn := range connList {
 		switched := false
 		var errSwitch error = nil
@@ -375,7 +416,7 @@ func (t *ConnectionPool) allocateNewConnection() (retConn *Connection, retErr er
 	t.rwMutex.Lock()
 	if len(t.connList) >= t.kw.MaxConnNum {
 		t.rwMutex.Unlock()
-		retErr = errors.New("unable to create a new gRPC connection, the maximum number of connections has already been reached")
+		retErr = define.ErrorReachedMaxConnNumLimit
 		return
 	}
 

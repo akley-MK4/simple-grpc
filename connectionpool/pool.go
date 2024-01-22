@@ -282,9 +282,7 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 		for _, oldStatus := range prioritySwitchFromStatusListToIdle {
 			conn, errSwitch := t.allocateConnectionByUsingStatus(oldStatus, t.getConnections())
 			if errSwitch != nil {
-				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, unable to switch to the correct using status, "+
-					"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
-					conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), errSwitch)
+				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, %v", errSwitch)
 				continue
 			}
 			if conn == nil {
@@ -405,11 +403,9 @@ func (t *ConnectionPool) allocateConnectionByUsingStatus(oldStatus uintptr, conn
 				errSwitch = define.ErrorConnectionTimedOut
 			}
 
-			//logger.GetLoggerInstance().WarningF("An error occurs when switching the using status of a gRPC connection to busy using status, "+
-			//	"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
-			//	conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), errSwitch)
-			//break
-			retErr = errSwitch
+			retErr = fmt.Errorf("an error occurs when switching the using status of a gRPC connection to busy using status, "+
+				"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
+				conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), errSwitch)
 			return
 		}
 

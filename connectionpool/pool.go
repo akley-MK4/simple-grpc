@@ -60,6 +60,10 @@ func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 
 		// Open the gRPC connection
 		if err := conn.open(); err != nil {
+			if err.Error() == "context deadline exceeded" {
+				err = define.ErrorConnectionTimedOut
+			}
+
 			logger.GetLoggerInstance().WarningF("Failed to create a gRPC connection, Id: %v, Target %v, UsingStatus: %v, Err: %v",
 				conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), err)
 			continue
@@ -397,10 +401,16 @@ func (t *ConnectionPool) allocateConnectionByUsingStatus(oldStatus uintptr, conn
 
 		switched, errSwitch = switchUsingStatusFunc()
 		if errSwitch != nil {
-			logger.GetLoggerInstance().WarningF("An error occurs when switching the using status of a gRPC connection to busy using status, "+
-				"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
-				conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), errSwitch)
-			continue
+			if errSwitch.Error() == "context deadline exceeded" {
+				errSwitch = define.ErrorConnectionTimedOut
+			}
+
+			//logger.GetLoggerInstance().WarningF("An error occurs when switching the using status of a gRPC connection to busy using status, "+
+			//	"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
+			//	conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), errSwitch)
+			//break
+			retErr = errSwitch
+			return
 		}
 
 		if switched {
@@ -427,6 +437,9 @@ func (t *ConnectionPool) allocateNewConnection() (retConn *Connection, retErr er
 
 	if err := newConn.open(); err != nil {
 		newConn.setUsingStatus(define.NotOpenUsingStatus)
+		if err.Error() == "context deadline exceeded" {
+			err = define.ErrorConnectionTimedOut
+		}
 		retErr = err
 		return
 	}
@@ -438,5 +451,6 @@ func (t *ConnectionPool) allocateNewConnection() (retConn *Connection, retErr er
 	}
 
 	newConn.setUsingStatus(define.DisconnectedUsingStatus)
+	retErr = errors.New("unable to switch to Ready status")
 	return
 }

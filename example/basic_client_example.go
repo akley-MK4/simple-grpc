@@ -112,7 +112,7 @@ func testMaxAllocateAndRecycleConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != maxConnNum {
+	if count != maxConnNum || getConnPoolInst().GetBusyConnectionsCount() != maxConnNum || getConnPoolInst().GetIdledConnectionsCount() != 0 {
 		return fmt.Errorf("current number of busy using status connections is incorrect, %d != %d", count, maxConnNum)
 	}
 
@@ -122,7 +122,7 @@ func testMaxAllocateAndRecycleConnections() error {
 	}
 
 	_, errMaxConnLimit := getConnPoolInst().AllocateConnection()
-	if errMaxConnLimit == nil {
+	if errMaxConnLimit == nil || errMaxConnLimit != define.ErrorReachedMaxConnNumLimit {
 		return errors.New("the maximum number of connections limit has failed")
 	}
 	logger.GetLoggerInstance().Info("Successfully limited the maximum number of connections")
@@ -155,7 +155,7 @@ func testMaxAllocateAndRecycleConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != maxConnNum {
+	if count != maxConnNum || getConnPoolInst().GetIdledConnectionsCount() != maxConnNum || getConnPoolInst().GetBusyConnectionsCount() != 0 {
 		return fmt.Errorf("current number of idled using status connections is incorrect, %d != %d", count, maxConnNum)
 	}
 
@@ -172,7 +172,7 @@ func testShrinkAndKeepMinIdledConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum {
+	if count != minIdleConnNum || getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum {
 		return fmt.Errorf("[2] current number of idled using status connections is incorrect, %d != %d", count, minIdleConnNum)
 	}
 	count = getConnPoolInst().GetReadyConnectionsCount()
@@ -186,21 +186,22 @@ func testShrinkAndKeepMinIdledConnections() error {
 		return errNewConn
 	}
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != (minIdleConnNum - 1) {
+	if count != (minIdleConnNum-1) || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum-1) {
 		return fmt.Errorf("[4] current number of idle using status connections is incorrect, %d != %d", count, minIdleConnNum-1)
 	}
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 1 {
+	if count != 1 || (getConnPoolInst().GetBusyConnectionsCount() != 1) {
 		return fmt.Errorf("[5] current number of busy using status connections is incorrect, %d != %d", count, 1)
 	}
 
+	logger.GetLoggerInstance().Info("Wait for new idled connections")
 	time.Sleep(time.Second*idledConnNumIntervalSec + 5)
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum {
+	if count != minIdleConnNum || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum) {
 		return fmt.Errorf("[6] current number of idle using status connections is incorrect, %d != %d", count, minIdleConnNum)
 	}
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 1 {
+	if count != 1 || (getConnPoolInst().GetBusyConnectionsCount() != 1) {
 		return fmt.Errorf("[7] current number of busy using status connections is incorrect, %d != %d", count, 1)
 	}
 
@@ -209,18 +210,18 @@ func testShrinkAndKeepMinIdledConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 0 {
+	if count != 0 || (getConnPoolInst().GetBusyConnectionsCount() != 0) {
 		return fmt.Errorf("[8] current number of busy using status connections is incorrect, %d != %d", count, 0)
 	}
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != (minIdleConnNum + 1) {
+	if count != (minIdleConnNum+1) || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum+1) {
 		return fmt.Errorf("[9] current number of idle using status connections is incorrect, %d != %d", count, (minIdleConnNum + 1))
 	}
 
 	logger.GetLoggerInstance().Info("Wait for shrink")
 	time.Sleep(time.Millisecond*maxIdleDurationMilliseconds + time.Second*10)
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum {
+	if count != minIdleConnNum || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum) {
 		return fmt.Errorf("[10] current number of idled using status connections is incorrect, %d != %d", count, minIdleConnNum)
 	}
 

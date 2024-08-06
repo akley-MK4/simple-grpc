@@ -324,21 +324,10 @@ func (t *ConnectionPool) checkAndUpdateUnpreparedConnections() (retCount int) {
 }
 
 func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
-	closedCount := uint64(0)
-
-	for _, conn := range t.getConnections() {
-		if conn.GetUsingStatus() != define.IdledUsingStatus || conn.GetConnStatus() == connectivity.Ready {
-			continue
-		}
-		if conn.switchFromIdledToNotOpenUsingStatus() {
-			closedCount++
-			atomic.AddInt32(&t.idledConnCount, -1)
-		}
-	}
-
 	nowTp := time.Now().UnixMilli()
 	var expiredConnList list.List
 
+	closedCount := uint64(0)
 	for _, conn := range t.getConnections() {
 		idledTp := conn.GetIdledMilliTimestamp()
 		if conn.GetUsingStatus() != define.IdledUsingStatus || idledTp <= 0 || nowTp <= idledTp {

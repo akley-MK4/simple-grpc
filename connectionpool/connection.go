@@ -84,7 +84,7 @@ func (t *Connection) GetIdledMilliTimestamp() int64 {
 
 func (t *Connection) GetConnStatus() connectivity.State {
 	if t.grpcConn == nil {
-		return connectivity.State(define.GRPCConnStatusInvalid)
+		return connectivity.Shutdown
 	}
 
 	return t.grpcConn.GetState()
@@ -254,6 +254,11 @@ func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (switched bool, r
 func (t *Connection) switchFromIdledToNotOpenUsingStatus() bool {
 	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.IdledUsingStatus, define.ClosingUsingStatus) {
 		return false
+	}
+
+	if t.grpcConn == nil {
+		t.usingStatus = define.NotOpenUsingStatus
+		return true
 	}
 
 	if err := t.grpcConn.Close(); err != nil {

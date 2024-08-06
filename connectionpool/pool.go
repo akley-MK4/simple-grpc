@@ -42,13 +42,13 @@ type KwArgsConnPool struct {
 	MaxConnNum                   int
 	MinIdledConnNum              int
 	MaxIdledDurationMilliseconds uint64
-	CheckIdledConnNumInterval    time.Duration
+	CheckAndUpdateInterval       time.Duration
 }
 
 func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 	// check parameters
 	if kw.Target == "" || len(kw.DialOpts) <= 0 || kw.MaxConnNum <= 0 || kw.MinIdledConnNum > kw.MaxConnNum ||
-		kw.MaxIdledDurationMilliseconds <= 0 || kw.NewConnTimeout <= 0 || kw.CheckIdledConnNumInterval <= 0 {
+		kw.MaxIdledDurationMilliseconds <= 0 || kw.NewConnTimeout <= 0 || kw.CheckAndUpdateInterval <= 0 {
 		return nil, errors.New("invalid parameters")
 	}
 
@@ -91,9 +91,8 @@ func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 		status:         define.InitializedPoolStatus,
 		idledConnCount: int32(readyConnCount),
 	}
-	connPool.shrinkCancelCtx, connPool.shrinkCancelFunc = context.WithCancel(context.Background())
-	connPool.keepActiveCtx, connPool.keepActiveCancelFunc = context.WithCancel(context.Background())
 
+	connPool.checkCancelCtx, connPool.checkCancelFunc = context.WithCancel(context.Background())
 	return connPool, nil
 }
 
@@ -105,10 +104,8 @@ type ConnectionPool struct {
 	connList []*Connection
 	rwMutex  sync.RWMutex
 
-	shrinkCancelFunc     context.CancelFunc
-	shrinkCancelCtx      context.Context
-	keepActiveCancelFunc context.CancelFunc
-	keepActiveCtx        context.Context
+	checkCancelFunc context.CancelFunc
+	checkCancelCtx  context.Context
 
 	idledConnCount int32
 	busyConnCount  int32
@@ -131,8 +128,7 @@ func (t *ConnectionPool) Start() error {
 		return fmt.Errorf("wrong old pool status %v", t.status)
 	}
 
-	go t.checkAndShrinkIdledConnectionsPeriodically()
-	go t.checkAndAddIdledConnectionsPeriodically()
+	go t.checkAndUpdateConnectionsPeriodically()
 
 	t.status = define.StartedPoolStatus
 	return nil
@@ -143,8 +139,7 @@ func (t *ConnectionPool) Stop(disableClean bool) error {
 		return fmt.Errorf("wrong old pool status %v", t.status)
 	}
 
-	t.shrinkCancelFunc()
-	t.keepActiveCancelFunc()
+	t.checkCancelFunc()
 
 	for _, conn := range t.getConnections() {
 		if err := conn.stop(); err != nil {
@@ -246,32 +241,6 @@ func (t *ConnectionPool) GetUsingStatusConnectionsCount(usingStatus uintptr) (re
 	return
 }
 
-func (t *ConnectionPool) checkAndAddIdledConnectionsPeriodically() {
-	logger.GetLoggerInstance().Debug("Started periodic check and add the gRPC connections of the idled status")
-	timer := time.NewTicker(t.kw.CheckIdledConnNumInterval)
-
-loopEnd:
-	for {
-		select {
-		case <-timer.C:
-			if t.status == define.StoppedPoolStatus {
-				break loopEnd
-			}
-
-			newActivatedCount := t.checkAndAddIdledConnections()
-			if newActivatedCount > 0 {
-				logger.GetLoggerInstance().DebugF("Successfully added %d gRPC connections of the idled status", newActivatedCount)
-			}
-			break
-		case <-t.keepActiveCtx.Done():
-			break loopEnd
-		}
-	}
-
-	timer.Stop()
-	logger.GetLoggerInstance().Debug("Exited periodic check and add the gRPC connections of the idled status")
-}
-
 func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 	idledCount := t.GetUsingStatusConnectionsCount(define.IdledUsingStatus)
 	if idledCount >= t.kw.MinIdledConnNum {
@@ -305,9 +274,9 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 	return
 }
 
-func (t *ConnectionPool) checkAndShrinkIdledConnectionsPeriodically() {
-	logger.GetLoggerInstance().Debug("Started periodic check and shrink the gRPC connections of the idled status")
-	timer := time.NewTicker(time.Millisecond * time.Duration(t.kw.MaxIdledDurationMilliseconds))
+func (t *ConnectionPool) checkAndUpdateConnectionsPeriodically() {
+	logger.GetLoggerInstance().Debug("Started periodic check and update the gRPC connections of the status")
+	timer := time.NewTicker(t.kw.CheckAndUpdateInterval)
 
 loopEnd:
 	for {
@@ -316,18 +285,42 @@ loopEnd:
 			if t.status == define.StoppedPoolStatus {
 				break loopEnd
 			}
-			closedCount := t.checkAndShrinkIdledConnections()
-			if closedCount > 0 {
-				logger.GetLoggerInstance().DebugF("Shrinked %d gRPC connections of the idled status", closedCount)
+
+			if retCount := t.checkAndUpdateUnpreparedConnections(); retCount > 0 {
+				logger.GetLoggerInstance().DebugF("Updated %d unprepared connections to %v status", retCount,
+					define.GetUsingStatusDesc(define.NotOpenUsingStatus))
+			}
+
+			if retCount := t.checkAndAddIdledConnections(); retCount > 0 {
+				logger.GetLoggerInstance().DebugF("Successfully added %d gRPC connections of the idled status", retCount)
+			}
+
+			if retCount := t.checkAndShrinkIdledConnections(); retCount > 0 {
+				logger.GetLoggerInstance().DebugF("Shrinked %d gRPC connections of the idled status", retCount)
 			}
 			break
-		case <-t.shrinkCancelCtx.Done():
+		case <-t.checkCancelCtx.Done():
 			break loopEnd
 		}
 	}
 
 	timer.Stop()
 	logger.GetLoggerInstance().Debug("Exited periodic check and shrink the gRPC connections of the idle status")
+}
+
+func (t *ConnectionPool) checkAndUpdateUnpreparedConnections() (retCount int) {
+	for _, conn := range t.getConnections() {
+		if conn.GetConnStatus() == connectivity.Ready {
+			continue
+		}
+
+		if conn.GetUsingStatus() == define.IdledUsingStatus && conn.switchFromIdledToNotOpenUsingStatus() {
+			retCount++
+			atomic.AddInt32(&t.idledConnCount, -1)
+		}
+	}
+
+	return
 }
 
 func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {

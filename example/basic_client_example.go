@@ -15,7 +15,7 @@ import (
 
 const (
 	maxWorkerNum                = 10
-	maxConnNum                  = 100
+	maxConnNum                  = 50
 	minIdleConnNum              = 20
 	maxIdleDurationMilliseconds = 1000 * 10
 	idledConnNumIntervalSec     = 5
@@ -42,7 +42,7 @@ func RunBasicClientExample() error {
 		MinIdledConnNum: minIdleConnNum,
 		//MaxIdleDurationMilli: 100 * 60,
 		MaxIdledDurationMilliseconds: maxIdleDurationMilliseconds,
-		CheckIdledConnNumInterval:    time.Second * time.Duration(idledConnNumIntervalSec),
+		CheckAndUpdateInterval:       time.Second * time.Duration(idledConnNumIntervalSec),
 	}
 
 	kw.DialOpts = append(kw.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))

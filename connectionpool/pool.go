@@ -331,6 +331,18 @@ loopEnd:
 }
 
 func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
+	closedCount := uint64(0)
+
+	for _, conn := range t.getConnections() {
+		if conn.GetUsingStatus() != define.IdledUsingStatus || conn.GetConnStatus() == connectivity.Ready {
+			continue
+		}
+		if conn.switchFromIdledToNotOpenUsingStatus() {
+			closedCount++
+			atomic.AddInt32(&t.idledConnCount, -1)
+		}
+	}
+
 	nowTp := time.Now().UnixMilli()
 	var expiredConnList list.List
 
@@ -354,7 +366,6 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 	var wg sync.WaitGroup
 	wg.Add(needClosedCount)
 
-	closedCount := uint64(0)
 	for i := 0; i < needClosedCount; i++ {
 		elem := expiredConnList.Back()
 		expiredConnList.Remove(elem)

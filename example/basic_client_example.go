@@ -57,7 +57,17 @@ func RunBasicClientExample() error {
 	}
 
 	connPoolInst = connPool
-	time.Sleep(time.Second * 1)
+	go func() {
+		for {
+			time.Sleep(time.Second * 5)
+			logger.GetLoggerInstance().InfoF("ConnectionsCount: %v, ReadyConnectionsCount: %v, BusyConnectionsCount: %v, "+
+				"IdledConnectionsCount: %v",
+				connPool.GetConnectionsCount(), connPool.GetReadyConnectionsCount(), connPool.GetBusyConnectionsCount(),
+				connPool.GetIdledConnectionsCount())
+		}
+	}()
+
+	//time.Sleep(time.Second * 1000)
 
 	if err := testMaxAllocateAndRecycleConnections(); err != nil {
 		return fmt.Errorf("failed to test the testMaxAllocateAndRecycleConnections function, %v", err)

@@ -120,7 +120,7 @@ func (t *Connection) open() error {
 	ctx, cancel := context.WithTimeout(context.Background(), t.connectTimeout)
 	defer cancel()
 
-	grpcConn, err := grpc.DialContext(ctx, t.target, append(t.opts, grpc.WithBlock())...)
+	grpcConn, err := grpc.DialContext(ctx, t.target, append(t.opts, grpc.WithReturnConnectionError())...)
 	if err != nil {
 		return err
 	}

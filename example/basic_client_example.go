@@ -104,7 +104,7 @@ func RunBasicClientExample() error {
 	}
 
 	logger.GetLoggerInstance().InfoF("Successfully switched connection to target %v\n\n", kw.Target)
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 20)
 
 	if err := testMaxAllocateAndRecycleConnections(); err != nil {
 		return fmt.Errorf("failed to test the testMaxAllocateAndRecycleConnections function, %v", err)

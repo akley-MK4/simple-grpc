@@ -331,13 +331,12 @@ loopEnd:
 
 			t.status = define.UpdatingPoolStatus
 			logger.GetLoggerInstance().Info("Start updating the gRPC connection pool")
-			cleanConnNum, err := t.cleanConnections()
+			t.kw = kw
+			cleanConnNum, err := t.resetConnections()
 			if err != nil {
 				logger.GetLoggerInstance().WarningF("Failed to update the gRPC connection pool, unable to clear old connections, %v", err)
-				break
 			}
 
-			t.kw = kw
 			t.status = define.RunningPoolStatus
 			logger.GetLoggerInstance().InfoF("Completed the update of the gRPC connection pool, cleared %d old connections", cleanConnNum)
 		}
@@ -483,7 +482,7 @@ func (t *ConnectionPool) allocateNewConnection() (retConn *Connection, retErr er
 	return
 }
 
-func (t *ConnectionPool) cleanConnections() (int, error) {
+func (t *ConnectionPool) resetConnections() (int, error) {
 	for i := 0; i < MaxCheckBusyConnNum; i++ {
 		time.Sleep(time.Second)
 		if atomic.LoadInt32(&t.busyConnCount) <= 0 {
@@ -495,9 +494,15 @@ func (t *ConnectionPool) cleanConnections() (int, error) {
 		return 0, errors.New("there are busy connections that cannot be cleared")
 	}
 
+	var newConnList []*Connection
+	for i := 0; i < t.kw.MinIdledConnNum; i++ {
+		conn := newConnection(t.kw.Target, t.kw.DialOpts, t.kw.NewConnTimeout)
+		newConnList = append(newConnList, conn)
+	}
+
 	t.rwMutex.Lock()
 	connList := t.connList
-	t.connList = []*Connection{}
+	t.connList = newConnList
 	t.rwMutex.Unlock()
 	t.idledConnCount = 0
 	for _, conn := range connList {

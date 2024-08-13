@@ -90,7 +90,7 @@ func (t *Connection) GetConnStatus() connectivity.State {
 	return t.grpcConn.GetState()
 }
 
-func (t *Connection) stop() error {
+func (t *Connection) stop(force bool) error {
 	switchedStatus := false
 	for _, oldStatus := range prioritySwitchFromStatusListToStopping {
 		if atomic.CompareAndSwapUintptr(&t.usingStatus, oldStatus, define.StoppingUsingStatus) {
@@ -99,7 +99,7 @@ func (t *Connection) stop() error {
 		}
 	}
 
-	if !switchedStatus {
+	if !switchedStatus && !force {
 		return fmt.Errorf("current using status is %v and cannot be closed", t.usingStatus)
 	}
 

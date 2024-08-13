@@ -79,6 +79,43 @@ func RunBasicClientExample() error {
 	}
 	logger.GetLoggerInstance().Info("Successfully tested the testShrinkAndKeepMinIdledConnections function")
 
+	kw.Target = fmt.Sprintf("0.0.0.0:%d", listenPort2)
+	maxUpdateChanCapacity := connectionpool.MaxUpdateChanCapacity + 5
+	for i := 0; i < maxUpdateChanCapacity; i++ {
+		err := connPoolInst.PubUpdateEvent(&kw)
+		if (i+1) >= connectionpool.MaxUpdateChanCapacity && err == define.ErrReachedUpdateChanCapacity {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	time.Sleep(time.Second * 2)
+	for i := 0; i < 20; i++ {
+		if connPoolInst.GetStatus() == define.RunningPoolStatus {
+			break
+		}
+		logger.GetLoggerInstance().Info("Waiting for the connection pool status to switch to RunningPoolStatus")
+		time.Sleep(time.Second * 2)
+	}
+	if connPoolInst.GetStatus() != define.RunningPoolStatus {
+		return errors.New("waiting for the connection pool status to switch to RunningPoolStatus timed out")
+	}
+
+	logger.GetLoggerInstance().InfoF("Successfully switched connection to target %v\n\n", kw.Target)
+	time.Sleep(time.Second * 5)
+
+	if err := testMaxAllocateAndRecycleConnections(); err != nil {
+		return fmt.Errorf("failed to test the testMaxAllocateAndRecycleConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testMaxAllocateAndRecycleConnections function")
+
+	if err := testShrinkAndKeepMinIdledConnections(); err != nil {
+		return fmt.Errorf("failed to test the testShrinkAndKeepMinIdledConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testShrinkAndKeepMinIdledConnections function")
+
 	if err := testStopPool(); err != nil {
 		return fmt.Errorf("failed to test the testStopPool function, %v", err)
 	}

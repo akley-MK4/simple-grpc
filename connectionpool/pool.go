@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	MaxCheckBusyConnNum   = 30
+	MaxUpdateChanCapacity = 5
+)
+
 var (
 	prioritySwitchFromStatusListToBusy = []uintptr{
 		define.IdledUsingStatus,
@@ -90,6 +95,7 @@ func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 		connList:       connList,
 		status:         define.InitializedPoolStatus,
 		idledConnCount: int32(readyConnCount),
+		updateChan:     make(chan *KwArgsConnPool, MaxUpdateChanCapacity),
 	}
 
 	connPool.checkCancelCtx, connPool.checkCancelFunc = context.WithCancel(context.Background())
@@ -109,10 +115,16 @@ type ConnectionPool struct {
 
 	idledConnCount int32
 	busyConnCount  int32
+
+	updateChan chan *KwArgsConnPool
 }
 
 func (t *ConnectionPool) GetStatus() uintptr {
 	return t.status
+}
+
+func (t *ConnectionPool) GetStatusDesc() string {
+	return define.GetPoolStatusDesc(t.status)
 }
 
 func (t *ConnectionPool) GetIdledConnectionsCount() int32 {
@@ -130,26 +142,28 @@ func (t *ConnectionPool) Start() error {
 
 	go t.checkAndUpdateConnectionsPeriodically()
 
-	t.status = define.StartedPoolStatus
+	t.status = define.RunningPoolStatus
 	return nil
 }
 
 func (t *ConnectionPool) Stop(disableClean bool) error {
-	if !atomic.CompareAndSwapUintptr(&t.status, define.StartedPoolStatus, define.StoppingPoolStatus) {
+	if !atomic.CompareAndSwapUintptr(&t.status, define.RunningPoolStatus, define.StoppingPoolStatus) {
 		return fmt.Errorf("wrong old pool status %v", t.status)
 	}
 
 	t.checkCancelFunc()
 
 	for _, conn := range t.getConnections() {
-		if err := conn.stop(); err != nil {
+		if err := conn.stop(false); err != nil {
 			logger.GetLoggerInstance().WarningF("Failed to close a gRPC connection, Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
 				conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), err)
 		}
 	}
 
 	if !disableClean {
+		t.rwMutex.Lock()
 		t.connList = []*Connection{}
+		t.rwMutex.Unlock()
 	}
 
 	t.status = define.StoppedPoolStatus
@@ -157,7 +171,7 @@ func (t *ConnectionPool) Stop(disableClean bool) error {
 }
 
 func (t *ConnectionPool) AllocateConnection() (retConn *Connection, retErr error) {
-	if t.status != define.StartedPoolStatus {
+	if t.status != define.RunningPoolStatus {
 		retErr = fmt.Errorf("wrong pool status %v", t.status)
 		return
 	}
@@ -200,7 +214,7 @@ func (t *ConnectionPool) RecycleConnection(conn *Connection) error {
 	if conn == nil {
 		return errors.New("the parameter conn is a nil point")
 	}
-	if t.status != define.StartedPoolStatus {
+	if t.status != define.RunningPoolStatus && t.status != define.UpdatingPoolStatus {
 		return fmt.Errorf("wrong pool status %v", t.status)
 	}
 
@@ -216,10 +230,16 @@ func (t *ConnectionPool) RecycleConnection(conn *Connection) error {
 }
 
 func (t *ConnectionPool) getConnections() []*Connection {
+	t.rwMutex.RLock()
+	defer t.rwMutex.RUnlock()
+
 	return t.connList
 }
 
 func (t *ConnectionPool) GetConnectionsCount() int {
+	t.rwMutex.RLock()
+	defer t.rwMutex.RUnlock()
+
 	return len(t.connList)
 }
 
@@ -285,6 +305,9 @@ loopEnd:
 			if t.status == define.StoppedPoolStatus {
 				break loopEnd
 			}
+			if t.status == define.UpdatingPoolStatus {
+				continue
+			}
 
 			if retCount := t.checkAndUpdateUnpreparedConnections(); retCount > 0 {
 				logger.GetLoggerInstance().DebugF("Updated %d unprepared connections to %v status", retCount,
@@ -301,6 +324,22 @@ loopEnd:
 			break
 		case <-t.checkCancelCtx.Done():
 			break loopEnd
+		case kw, ok := <-t.updateChan:
+			if !ok {
+				break loopEnd
+			}
+
+			t.status = define.UpdatingPoolStatus
+			logger.GetLoggerInstance().Info("Start updating the gRPC connection pool")
+			cleanConnNum, err := t.cleanConnections()
+			if err != nil {
+				logger.GetLoggerInstance().WarningF("Failed to update the gRPC connection pool, unable to clear old connections, %v", err)
+				break
+			}
+
+			t.kw = kw
+			t.status = define.RunningPoolStatus
+			logger.GetLoggerInstance().InfoF("Completed the update of the gRPC connection pool, cleared %d old connections", cleanConnNum)
 		}
 	}
 
@@ -442,4 +481,42 @@ func (t *ConnectionPool) allocateNewConnection() (retConn *Connection, retErr er
 	newConn.setUsingStatus(define.DisconnectedUsingStatus)
 	retErr = errors.New("unable to switch to Ready status")
 	return
+}
+
+func (t *ConnectionPool) cleanConnections() (int, error) {
+	for i := 0; i < MaxCheckBusyConnNum; i++ {
+		time.Sleep(time.Second)
+		if atomic.LoadInt32(&t.busyConnCount) <= 0 {
+			break
+		}
+	}
+
+	if atomic.LoadInt32(&t.busyConnCount) > 0 {
+		return 0, errors.New("there are busy connections that cannot be cleared")
+	}
+
+	t.rwMutex.Lock()
+	connList := t.connList
+	t.connList = []*Connection{}
+	t.rwMutex.Unlock()
+	t.idledConnCount = 0
+	for _, conn := range connList {
+		_ = conn.stop(true)
+	}
+
+	return len(connList), nil
+}
+
+func (t *ConnectionPool) PubUpdateEvent(kw *KwArgsConnPool) error {
+	if kw == nil {
+		return errors.New("invalid keyword args")
+	}
+	if len(t.updateChan) >= MaxUpdateChanCapacity {
+		return define.ErrReachedUpdateChanCapacity
+	}
+
+	t.status = define.UpdatingPoolStatus
+	t.updateChan <- kw
+
+	return nil
 }

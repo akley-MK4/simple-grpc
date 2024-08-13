@@ -43,7 +43,29 @@ const (
 	UninitializedPoolStatus uintptr = iota
 	InitializedPoolStatus
 	StartingPoolStatus
-	StartedPoolStatus
+	RunningPoolStatus
 	StoppingPoolStatus
 	StoppedPoolStatus
+	UpdatingPoolStatus
 )
+
+var (
+	poolStatusDescMap = map[uintptr]string{
+		UninitializedPoolStatus: "Uninitialized",
+		InitializedPoolStatus:   "Initialized",
+		StartingPoolStatus:      "Starting",
+		RunningPoolStatus:       "Running",
+		StoppingPoolStatus:      "Stopping",
+		StoppedPoolStatus:       "Stopped",
+		UpdatingPoolStatus:      "Updating",
+	}
+)
+
+func GetPoolStatusDesc(status uintptr) string {
+	desc, exist := poolStatusDescMap[status]
+	if !exist {
+		return fmt.Sprintf("Unknown status %v", status)
+	}
+
+	return desc
+}

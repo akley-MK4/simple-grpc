@@ -172,7 +172,7 @@ func (t *ConnectionPool) Stop(disableClean bool) error {
 
 func (t *ConnectionPool) AllocateConnection() (retConn *Connection, retErr error) {
 	if t.status != define.RunningPoolStatus {
-		retErr = fmt.Errorf("wrong pool status %v", t.status)
+		retErr = fmt.Errorf("wrong pool status %v", define.GetPoolStatusDesc(t.status))
 		return
 	}
 

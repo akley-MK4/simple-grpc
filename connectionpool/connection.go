@@ -25,7 +25,7 @@ var (
 	incConnId uint64
 )
 
-type connSwitchToBusyUsingStatusFunc func() (switched bool, retErr error)
+type connSwitchToBusyUsingStatusFunc func() (chgStatus, switched bool, retErr error)
 
 func newConnection(target string, opts []grpc.DialOption, connectTimeout time.Duration) *Connection {
 	conn := &Connection{
@@ -194,10 +194,11 @@ func (t *Connection) waitForGrpcConnReady() bool {
 	return t.grpcConn.GetState() == connectivity.Ready
 }
 
-func (t *Connection) switchFromIdleToBusyUsingStatus() (switched bool, retErr error) {
+func (t *Connection) switchFromIdleToBusyUsingStatus() (retChgStatus, switched bool, retErr error) {
 	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.IdledUsingStatus, define.BusyUsingStatus) {
 		return
 	}
+	retChgStatus = true
 
 	if t.grpcConn == nil {
 		t.usingStatus = define.NotOpenUsingStatus
@@ -213,7 +214,7 @@ func (t *Connection) switchFromIdleToBusyUsingStatus() (switched bool, retErr er
 	return
 }
 
-func (t *Connection) switchFromNotOpenToBusyUsingStatus() (switched bool, retErr error) {
+func (t *Connection) switchFromNotOpenToBusyUsingStatus() (retChgStatus, switched bool, retErr error) {
 	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.NotOpenUsingStatus, define.BusyUsingStatus) {
 		return
 	}
@@ -224,6 +225,7 @@ func (t *Connection) switchFromNotOpenToBusyUsingStatus() (switched bool, retErr
 		return
 	}
 
+	retChgStatus = true
 	switched = t.checkAndWaitForGRPCConnReady()
 	if !switched {
 		t.usingStatus = define.DisconnectedUsingStatus
@@ -232,10 +234,11 @@ func (t *Connection) switchFromNotOpenToBusyUsingStatus() (switched bool, retErr
 	return
 }
 
-func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (switched bool, retErr error) {
+func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (retChgStatus, switched bool, retErr error) {
 	if !atomic.CompareAndSwapUintptr(&t.usingStatus, define.DisconnectedUsingStatus, define.BusyUsingStatus) {
 		return
 	}
+	retChgStatus = true
 
 	if t.grpcConn == nil {
 		t.usingStatus = define.NotOpenUsingStatus
@@ -246,6 +249,7 @@ func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (switched bool, r
 	switched = t.checkAndWaitForGRPCConnReady()
 	if !switched {
 		t.usingStatus = define.DisconnectedUsingStatus
+		retChgStatus = false
 	}
 
 	return

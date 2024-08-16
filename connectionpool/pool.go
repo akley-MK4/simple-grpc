@@ -200,9 +200,6 @@ func (t *ConnectionPool) AllocateConnection() (retConn *Connection, retErr error
 			continue
 		}
 
-		if oldStatus == define.IdledUsingStatus {
-			atomic.AddInt32(&t.idledConnCount, -1)
-		}
 		return
 	}
 
@@ -408,6 +405,7 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 func (t *ConnectionPool) allocateConnectionByUsingStatus(oldStatus uintptr, connList []*Connection) (retConn *Connection, retErr error) {
 	for _, conn := range connList {
 		switched := false
+		chgStatus := false
 		var errSwitch error = nil
 		var switchUsingStatusFunc connSwitchToBusyUsingStatusFunc
 
@@ -428,7 +426,11 @@ func (t *ConnectionPool) allocateConnectionByUsingStatus(oldStatus uintptr, conn
 			return
 		}
 
-		switched, errSwitch = switchUsingStatusFunc()
+		chgStatus, switched, errSwitch = switchUsingStatusFunc()
+		if oldStatus == define.IdledUsingStatus && chgStatus {
+			atomic.AddInt32(&t.idledConnCount, -1)
+		}
+
 		if errSwitch != nil {
 			if errSwitch.Error() == "context deadline exceeded" {
 				errSwitch = define.ErrorConnectionTimedOut
@@ -504,7 +506,7 @@ func (t *ConnectionPool) resetConnections() (int, error) {
 	connList := t.connList
 	t.connList = newConnList
 	t.rwMutex.Unlock()
-	t.idledConnCount = 0
+	atomic.StoreInt32(&t.idledConnCount, 0)
 	for _, conn := range connList {
 		_ = conn.stop(true)
 	}

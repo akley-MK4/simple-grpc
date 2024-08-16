@@ -61,9 +61,11 @@ func RunBasicClientExample() error {
 		for {
 			time.Sleep(time.Second * 5)
 			logger.GetLoggerInstance().InfoF("ConnectionsCount: %v, ReadyConnectionsCount: %v, BusyConnectionsCount: %v, "+
-				"IdledConnectionsCount: %v",
+				"IdledConnectionsCount: %v, NotOpenUsingStatusCount: %v, DisconnectedUsingStatusCount: %v, StoppedUsingStatus: %v",
 				connPool.GetConnectionsCount(), connPool.GetReadyConnectionsCount(), connPool.GetBusyConnectionsCount(),
-				connPool.GetIdledConnectionsCount())
+				connPool.GetIdledConnectionsCount(), connPool.GetUsingStatusConnectionsCount(define.NotOpenUsingStatus),
+				connPool.GetUsingStatusConnectionsCount(define.DisconnectedUsingStatus),
+				connPool.GetUsingStatusConnectionsCount(define.StoppedUsingStatus))
 		}
 	}()
 

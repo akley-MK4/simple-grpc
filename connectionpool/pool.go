@@ -315,7 +315,7 @@ loopEnd:
 			}
 
 			if retCount := t.checkAndAddIdledConnections(); retCount > 0 {
-				logger.GetLoggerInstance().DebugF("Successfully added %d gRPC connections of the idled status", retCount)
+				logger.GetLoggerInstance().InfoF("Successfully added %d gRPC connections of the idled status", retCount)
 			}
 
 			if retCount := t.checkAndShrinkIdledConnections(); retCount > 0 {

@@ -3,22 +3,23 @@ package example
 import (
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/akley-MK4/simple-grpc/connectionpool"
 	"github.com/akley-MK4/simple-grpc/define"
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-const (
+var (
 	maxWorkerNum                = 10
 	maxConnNum                  = 50
-	minIdleConnNum              = 20
-	maxIdleDurationMilliseconds = 1000 * 10
-	idledConnNumIntervalSec     = 5
+	minReadyConnsNum            = 20
+	idledConnExpireMilliseconds = 1000 * 20
+	readyConnNumIntervalSec     = 5
 )
 
 var (
@@ -36,16 +37,22 @@ func RunBasicClientExample() error {
 
 	// Create connection pool
 	kw := connectionpool.KwArgsConnPool{
-		Target:          fmt.Sprintf("0.0.0.0:%d", listenPort),
-		NewConnTimeout:  time.Second * time.Duration(3),
-		MaxConnNum:      maxConnNum,
-		MinIdledConnNum: minIdleConnNum,
+		Target:           fmt.Sprintf("0.0.0.0:%d", listenPort),
+		NewConnTimeout:   time.Second * time.Duration(3),
+		MaxConnNum:       maxConnNum,
+		MinReadyConnsNum: minReadyConnsNum,
 		//MaxIdleDurationMilli: 100 * 60,
-		MaxIdledDurationMilliseconds: maxIdleDurationMilliseconds,
-		CheckAndUpdateInterval:       time.Second * time.Duration(idledConnNumIntervalSec),
+		MaxIdledDurationMilliseconds: uint64(idledConnExpireMilliseconds),
+		CheckAndUpdateInterval:       time.Second * time.Duration(readyConnNumIntervalSec),
+		ForceCloseExpiredIdledConns:  false,
 	}
 
 	kw.DialOpts = append(kw.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	kw.OnAddReadyConnections = func(addedConnsNum int) {
+		logger.GetLoggerInstance().InfoF("\n\n\nSuccessfully switched %d gRPC connections to the ready state, the current number of ready gRPC connections is %d\n\n\n",
+			addedConnsNum, connPoolInst.GetReadyConnectionsCount())
+	}
 
 	connPool, newConnPoolErr := connectionpool.NewConnectionPool(kw)
 	if newConnPoolErr != nil {
@@ -57,34 +64,90 @@ func RunBasicClientExample() error {
 	}
 
 	connPoolInst = connPool
+
+	printStats := func() {
+		if connPoolInst != nil {
+			logger.GetLoggerInstance().InfoF("PoolStatus: %v, ConnectionsNum: %v, ReadyConnectionsNum: %v, BusyConnectionsNum: %v, "+
+				"IdledConnectionsNum: %v, NotOpenUsingStatusNum: %v, DisconnectedUsingStatusNum: %v, StoppedUsingStatus: %v",
+				connPoolInst.GetStatusDesc(),
+				connPoolInst.GetConnectionsCount(), connPoolInst.GetReadyConnectionsCount(), connPoolInst.GetBusyConnectionsCount(),
+				connPoolInst.GetIdledConnectionsCount(), connPoolInst.GetUsingStatusConnectionsCount(define.NotOpenUsingStatus),
+				connPoolInst.GetUsingStatusConnectionsCount(define.DisconnectedUsingStatus),
+				connPoolInst.GetUsingStatusConnectionsCount(define.StoppedUsingStatus))
+		}
+	}
+
 	go func() {
 		for {
 			time.Sleep(time.Second * 5)
-			logger.GetLoggerInstance().InfoF("ConnectionsCount: %v, ReadyConnectionsCount: %v, BusyConnectionsCount: %v, "+
-				"IdledConnectionsCount: %v, NotOpenUsingStatusCount: %v, DisconnectedUsingStatusCount: %v, StoppedUsingStatus: %v",
-				connPool.GetConnectionsCount(), connPool.GetReadyConnectionsCount(), connPool.GetBusyConnectionsCount(),
-				connPool.GetIdledConnectionsCount(), connPool.GetUsingStatusConnectionsCount(define.NotOpenUsingStatus),
-				connPool.GetUsingStatusConnectionsCount(define.DisconnectedUsingStatus),
-				connPool.GetUsingStatusConnectionsCount(define.StoppedUsingStatus))
+			printStats()
 		}
 	}()
 
 	//time.Sleep(time.Second * 1000)
 
+	logger.GetLoggerInstance().Info("\n\n\n===============Starting the stage 1 for testing=================")
 	if err := testMaxAllocateAndRecycleConnections(); err != nil {
+		printStats()
 		return fmt.Errorf("failed to test the testMaxAllocateAndRecycleConnections function, %v", err)
 	}
 	logger.GetLoggerInstance().Info("Successfully tested the testMaxAllocateAndRecycleConnections function")
 
-	if err := testShrinkAndKeepMinIdledConnections(); err != nil {
-		return fmt.Errorf("failed to test the testShrinkAndKeepMinIdledConnections function, %v", err)
+	if err := testCloseExpiredUnusedConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testCloseExpiredUnusedConnections function, %v", err)
 	}
-	logger.GetLoggerInstance().Info("Successfully tested the testShrinkAndKeepMinIdledConnections function")
+	logger.GetLoggerInstance().Info("Successfully tested the testCloseExpiredUnusedConnections function")
 
+	if err := testCheckAndAddReadyConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testCheckAndAddReadyConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testCheckAndAddReadyConnections function")
+
+	logger.GetLoggerInstance().Info("\n\n\n===============Starting the stage 2 for testing=================")
+	if err := testForceCloseExpiredAddIdleConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testForceCloseExpiredAddIdleConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testForceCloseExpiredAddIdleConnections function")
+
+	if err := connPool.Stop(true); err != nil {
+		return err
+	}
+
+	logger.GetLoggerInstance().Info("\n\n\n===============Starting the stage 3 for testing=================")
+	connPool, newConnPoolErr = connectionpool.NewConnectionPool(kw)
+	if newConnPoolErr != nil {
+		return newConnPoolErr
+	}
+
+	if err := connPool.Start(); err != nil {
+		return err
+	}
+	connPoolInst = connPool
+
+	if err := testCheckAndAddReadyConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testCheckAndAddReadyConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testCheckAndAddReadyConnections function")
+	if err := testCloseExpiredUnusedConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testCloseExpiredUnusedConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testCloseExpiredUnusedConnections function")
+
+	logger.GetLoggerInstance().Info("\n\n\n===============Starting the stage 4 for testing=================")
 	kw.Target = fmt.Sprintf("0.0.0.0:%d", listenPort2)
+	minReadyConnsNum = 25
+	logger.GetLoggerInstance().InfoF("Set the MinReadyConnsNum to %v from %v", minReadyConnsNum, kw.MinReadyConnsNum)
+	kw.MinReadyConnsNum = minReadyConnsNum
 	maxUpdateChanCapacity := connectionpool.MaxUpdateChanCapacity + 5
 	for i := 0; i < maxUpdateChanCapacity; i++ {
-		err := connPoolInst.PubUpdateEvent(&kw)
+		err := connPoolInst.PubUpdateEvent(connectionpool.UpdateEventContext{
+			Kw: &kw,
+		})
 		if (i+1) >= connectionpool.MaxUpdateChanCapacity && err == define.ErrReachedUpdateChanCapacity {
 			continue
 		}
@@ -109,16 +172,25 @@ func RunBasicClientExample() error {
 	time.Sleep(time.Second * 20)
 
 	if err := testMaxAllocateAndRecycleConnections(); err != nil {
+		printStats()
 		return fmt.Errorf("failed to test the testMaxAllocateAndRecycleConnections function, %v", err)
 	}
 	logger.GetLoggerInstance().Info("Successfully tested the testMaxAllocateAndRecycleConnections function")
 
-	if err := testShrinkAndKeepMinIdledConnections(); err != nil {
+	if err := testCloseExpiredUnusedConnections(); err != nil {
+		printStats()
 		return fmt.Errorf("failed to test the testShrinkAndKeepMinIdledConnections function, %v", err)
 	}
 	logger.GetLoggerInstance().Info("Successfully tested the testShrinkAndKeepMinIdledConnections function")
 
+	if err := testCheckAndAddReadyConnections(); err != nil {
+		printStats()
+		return fmt.Errorf("failed to test the testCheckAndAddReadyConnections function, %v", err)
+	}
+	logger.GetLoggerInstance().Info("Successfully tested the testCheckAndAddReadyConnections function")
+
 	if err := testStopPool(); err != nil {
+		printStats()
 		return fmt.Errorf("failed to test the testStopPool function, %v", err)
 	}
 	logger.GetLoggerInstance().Info("Successfully tested the testStopPool function")
@@ -161,7 +233,7 @@ func testMaxAllocateAndRecycleConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != maxConnNum || getConnPoolInst().GetBusyConnectionsCount() != maxConnNum || getConnPoolInst().GetIdledConnectionsCount() != 0 {
+	if count != maxConnNum || getConnPoolInst().GetBusyConnectionsCount() != int32(maxConnNum) || getConnPoolInst().GetIdledConnectionsCount() != 0 {
 		return fmt.Errorf("current number of busy using status connections is incorrect, %d != %d", count, maxConnNum)
 	}
 
@@ -204,74 +276,92 @@ func testMaxAllocateAndRecycleConnections() error {
 	}
 
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != maxConnNum || getConnPoolInst().GetIdledConnectionsCount() != maxConnNum || getConnPoolInst().GetBusyConnectionsCount() != 0 {
+	if count != maxConnNum || getConnPoolInst().GetIdledConnectionsCount() != int32(maxConnNum) || getConnPoolInst().GetBusyConnectionsCount() != 0 {
 		return fmt.Errorf("current number of idled using status connections is incorrect, %d != %d", count, maxConnNum)
 	}
 
 	return nil
 }
 
-func testShrinkAndKeepMinIdledConnections() error {
-	logger.GetLoggerInstance().Info("Wait for shrink")
-	time.Sleep(time.Millisecond*maxIdleDurationMilliseconds + time.Second*10)
+func testCheckAndAddReadyConnections() error {
+	time.Sleep(time.Duration(readyConnNumIntervalSec+5) * time.Second)
+
+	if connsNum := getConnPoolInst().GetReadyConnectionsCount(); connsNum != minReadyConnsNum {
+		return fmt.Errorf("[2] current number of ready connections is incorrect, %d != %d", connsNum, minReadyConnsNum)
+	}
+	if connsNum := getConnPoolInst().GetBusyConnectionsCount(); int(connsNum) != 0 {
+		return fmt.Errorf("[3] current number of busy using status connections is incorrect, %d != %d", connsNum, 0)
+	}
+	if connsNum := getConnPoolInst().GetIdledConnectionsCount(); int(connsNum) != minReadyConnsNum {
+		return fmt.Errorf("[4] current number of ready connections is incorrect, %d != %d", connsNum, minReadyConnsNum)
+	}
+
+	return nil
+}
+
+func testForceCloseExpiredAddIdleConnections() error {
+	connPoolInst.PubUpdateEvent(connectionpool.UpdateEventContext{})
+	return testCheckAndAddReadyConnections()
+}
+
+func testCloseExpiredUnusedConnections() error {
+
+	var newConns []*connectionpool.Connection
+	for i := 0; i < int(maxConnNum); i++ {
+		conn, errNewConn := getConnPoolInst().AllocateConnection()
+		if errNewConn != nil {
+			return fmt.Errorf("[0] failed to allocate connection, %v", errNewConn)
+		}
+		newConns = append(newConns, conn)
+	}
 
 	count := getConnPoolInst().GetConnectionsCount()
 	if count != maxConnNum {
 		return fmt.Errorf("[1] current number of connections is incorrect, %d != %d", count, maxConnNum)
 	}
 
+	shoudReadyConnsNum := maxConnNum
 	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum || getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum {
-		return fmt.Errorf("[2] current number of idled using status connections is incorrect, %d != %d", count, minIdleConnNum)
+	if count != 0 || getConnPoolInst().GetIdledConnectionsCount() != 0 {
+		return fmt.Errorf("[2] current number of unused using status connections is incorrect, %d != %d", count, 0)
 	}
 	count = getConnPoolInst().GetReadyConnectionsCount()
-	if count != minIdleConnNum {
-		return fmt.Errorf("[3] current number of ready connections is incorrect, %d != %d", count, minIdleConnNum)
+	if count != shoudReadyConnsNum {
+		return fmt.Errorf("[3] current number of ready connections is incorrect, %d != %d", count, shoudReadyConnsNum)
+	}
+	if connsNum := getConnPoolInst().GetBusyConnectionsCount(); int(connsNum) != shoudReadyConnsNum {
+		return fmt.Errorf("[4] current number of busy using status connections is incorrect, %d != %d", connsNum, shoudReadyConnsNum)
 	}
 
-	logger.GetLoggerInstance().Info("Check for added idle connections")
-	newConn, errNewConn := getConnPoolInst().AllocateConnection()
-	if errNewConn != nil {
-		return errNewConn
-	}
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != (minIdleConnNum-1) || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum-1) {
-		return fmt.Errorf("[4] current number of idle using status connections is incorrect, %d != %d", count, minIdleConnNum-1)
-	}
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 1 || (getConnPoolInst().GetBusyConnectionsCount() != 1) {
-		return fmt.Errorf("[5] current number of busy using status connections is incorrect, %d != %d", count, 1)
+	if connsNum := getConnPoolInst().GetReadyConnectionsCount(); connsNum != shoudReadyConnsNum {
+		return fmt.Errorf("[5] current number of ready connections is incorrect, %d != %d", connsNum, shoudReadyConnsNum)
 	}
 
-	logger.GetLoggerInstance().Info("Wait for new idled connections")
-	time.Sleep(time.Second*idledConnNumIntervalSec + 5)
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum) {
-		return fmt.Errorf("[6] current number of idle using status connections is incorrect, %d != %d", count, minIdleConnNum)
-	}
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 1 || (getConnPoolInst().GetBusyConnectionsCount() != 1) {
-		return fmt.Errorf("[7] current number of busy using status connections is incorrect, %d != %d", count, 1)
+	for _, conn := range newConns {
+		if err := getConnPoolInst().RecycleConnection(conn); err != nil {
+			return fmt.Errorf("[6] Failed to recycle connection, Id: %d, Err: %v", conn.GetId(), err)
+		}
 	}
 
-	if err := getConnPoolInst().RecycleConnection(newConn); err != nil {
-		return err
+	if connsNum := getConnPoolInst().GetIdledConnectionsCount(); int(connsNum) != shoudReadyConnsNum {
+		return fmt.Errorf("[7] current number of ready connections is incorrect, %d != %d", connsNum, shoudReadyConnsNum)
 	}
 
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.BusyUsingStatus)
-	if count != 0 || (getConnPoolInst().GetBusyConnectionsCount() != 0) {
-		return fmt.Errorf("[8] current number of busy using status connections is incorrect, %d != %d", count, 0)
-	}
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != (minIdleConnNum+1) || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum+1) {
-		return fmt.Errorf("[9] current number of idle using status connections is incorrect, %d != %d", count, (minIdleConnNum + 1))
+	if connsNum := getConnPoolInst().GetBusyConnectionsCount(); int(connsNum) != 0 {
+		return fmt.Errorf("[8] current number of busy using status connections is incorrect, %d != %d", connsNum, 0)
 	}
 
 	logger.GetLoggerInstance().Info("Wait for shrink")
-	time.Sleep(time.Millisecond*maxIdleDurationMilliseconds + time.Second*10)
-	count = getConnPoolInst().GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if count != minIdleConnNum || (getConnPoolInst().GetIdledConnectionsCount() != minIdleConnNum) {
-		return fmt.Errorf("[10] current number of idled using status connections is incorrect, %d != %d", count, minIdleConnNum)
+	time.Sleep(time.Millisecond*time.Duration(idledConnExpireMilliseconds) + time.Second*60)
+
+	if connsNum := getConnPoolInst().GetReadyConnectionsCount(); connsNum != minReadyConnsNum {
+		return fmt.Errorf("[9] current number of ready connections is incorrect, %d != %d", connsNum, minReadyConnsNum)
+	}
+	if connsNum := getConnPoolInst().GetIdledConnectionsCount(); int(connsNum) != minReadyConnsNum {
+		return fmt.Errorf("[10] current number of ready connections is incorrect, %d != %d", connsNum, minReadyConnsNum)
+	}
+	if connsNum := getConnPoolInst().GetBusyConnectionsCount(); int(connsNum) != 0 {
+		return fmt.Errorf("[11] current number of busy using status connections is incorrect, %d != %d", connsNum, 0)
 	}
 
 	return nil

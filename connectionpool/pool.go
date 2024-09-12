@@ -5,13 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/akley-MK4/simple-grpc/define"
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 const (
@@ -45,21 +46,23 @@ type KwArgsConnPool struct {
 	NewConnTimeout time.Duration
 
 	MaxConnNum                   int
-	MinIdledConnNum              int
+	MinReadyConnsNum             int
 	MaxIdledDurationMilliseconds uint64
+	ForceCloseExpiredIdledConns  bool
 	CheckAndUpdateInterval       time.Duration
+	OnAddReadyConnections        OnAddReadyConnectionsFunc
 }
 
 func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 	// check parameters
-	if kw.Target == "" || len(kw.DialOpts) <= 0 || kw.MaxConnNum <= 0 || kw.MinIdledConnNum > kw.MaxConnNum ||
+	if kw.Target == "" || len(kw.DialOpts) <= 0 || kw.MaxConnNum <= 0 || kw.MinReadyConnsNum > kw.MaxConnNum ||
 		kw.MaxIdledDurationMilliseconds <= 0 || kw.NewConnTimeout <= 0 || kw.CheckAndUpdateInterval <= 0 {
 		return nil, errors.New("invalid parameters")
 	}
 
 	var connList []*Connection
 	readyConnCount := 0
-	for i := 0; i < kw.MinIdledConnNum; i++ {
+	for i := 0; i < kw.MinReadyConnsNum; i++ {
 		conn := newConnection(kw.Target, kw.DialOpts, kw.NewConnTimeout)
 		connList = append(connList, conn)
 
@@ -91,16 +94,23 @@ func NewConnectionPool(kw KwArgsConnPool) (*ConnectionPool, error) {
 
 	logger.GetLoggerInstance().DebugF("Successfully created %d ready gRPC connections", readyConnCount)
 	connPool := &ConnectionPool{
-		kw:             &kw,
-		connList:       connList,
-		status:         define.InitializedPoolStatus,
-		idledConnCount: int32(readyConnCount),
-		updateChan:     make(chan *KwArgsConnPool, MaxUpdateChanCapacity),
+		kw:                    &kw,
+		connList:              connList,
+		status:                define.InitializedPoolStatus,
+		idledConnCount:        int32(readyConnCount),
+		updateChan:            make(chan UpdateEventContext, MaxUpdateChanCapacity),
+		onAddReadyConnections: kw.OnAddReadyConnections,
 	}
 
 	connPool.checkCancelCtx, connPool.checkCancelFunc = context.WithCancel(context.Background())
 	return connPool, nil
 }
+
+type UpdateEventContext struct {
+	Kw *KwArgsConnPool
+}
+
+type OnAddReadyConnectionsFunc func(addedReadyConnsNum int)
 
 type ConnectionPool struct {
 	kw *KwArgsConnPool
@@ -116,7 +126,9 @@ type ConnectionPool struct {
 	idledConnCount int32
 	busyConnCount  int32
 
-	updateChan chan *KwArgsConnPool
+	updateChan chan UpdateEventContext
+
+	onAddReadyConnections OnAddReadyConnectionsFunc
 }
 
 func (t *ConnectionPool) GetStatus() uintptr {
@@ -258,17 +270,17 @@ func (t *ConnectionPool) GetUsingStatusConnectionsCount(usingStatus uintptr) (re
 	return
 }
 
-func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
-	idledCount := t.GetUsingStatusConnectionsCount(define.IdledUsingStatus)
-	if idledCount >= t.kw.MinIdledConnNum {
+func (t *ConnectionPool) checkAndAddReadyConnections() (retCount int) {
+	readyConnsCount := t.GetReadyConnectionsCount()
+	if readyConnsCount >= t.kw.MinReadyConnsNum {
 		return
 	}
 
-	for i := 0; i < t.kw.MinIdledConnNum-idledCount; i++ {
+	for i := 0; i < t.kw.MinReadyConnsNum-readyConnsCount; i++ {
 		for _, oldStatus := range prioritySwitchFromStatusListToIdle {
 			conn, errSwitch := t.allocateConnectionByUsingStatus(oldStatus, t.getConnections())
 			if errSwitch != nil {
-				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, %v", errSwitch)
+				logger.GetLoggerInstance().WarningF("Failed to add a ready gRPC connection, %v", errSwitch)
 				continue
 			}
 			if conn == nil {
@@ -278,13 +290,13 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 			atomic.AddInt32(&t.busyConnCount, 1)
 			// switch to idle status
 			if err := t.RecycleConnection(conn); err != nil {
-				logger.GetLoggerInstance().WarningF("Failed to add an idled gRPC connection, unable to recycle the connection, "+
+				logger.GetLoggerInstance().WarningF("Failed to add a ready gRPC connection, unable to recycle the connection, "+
 					"Id: %v, Target %v, UsingStatus: %v, ConnStatus: %v, Err: %v",
 					conn.GetId(), conn.GetTarget(), conn.GetUsingStatusDesc(), conn.GetConnStatus(), err)
 				continue
 			}
 
-			newIdledConnCount++
+			retCount++
 		}
 	}
 
@@ -292,7 +304,7 @@ func (t *ConnectionPool) checkAndAddIdledConnections() (newIdledConnCount int) {
 }
 
 func (t *ConnectionPool) checkAndUpdateConnectionsPeriodically() {
-	logger.GetLoggerInstance().Debug("Started periodic check and update the gRPC connections of the status")
+	logger.GetLoggerInstance().Debug("Started periodic check and update the gRPC connections")
 	timer := time.NewTicker(t.kw.CheckAndUpdateInterval)
 
 loopEnd:
@@ -311,36 +323,42 @@ loopEnd:
 					define.GetUsingStatusDesc(define.NotOpenUsingStatus))
 			}
 
-			if retCount := t.checkAndAddIdledConnections(); retCount > 0 {
-				logger.GetLoggerInstance().InfoF("Successfully added %d gRPC connections of the idled status", retCount)
+			if retCount := t.checkAndAddReadyConnections(); retCount > 0 {
+				if t.onAddReadyConnections != nil {
+					t.onAddReadyConnections(retCount)
+				}
 			}
 
-			if retCount := t.checkAndShrinkIdledConnections(); retCount > 0 {
-				logger.GetLoggerInstance().DebugF("Shrinked %d gRPC connections of the idled status", retCount)
+			if retCount := t.checkAndCloseExpiredIdledConnections(); retCount > 0 {
+				logger.GetLoggerInstance().DebugF("Closed %d expired gRPC connections", retCount)
 			}
-			break
 		case <-t.checkCancelCtx.Done():
 			break loopEnd
-		case kw, ok := <-t.updateChan:
+		case ctxt, ok := <-t.updateChan:
 			if !ok {
 				break loopEnd
 			}
 
 			t.status = define.UpdatingPoolStatus
-			logger.GetLoggerInstance().Info("Start updating the gRPC connection pool")
-			t.kw = kw
+			logger.GetLoggerInstance().Debug("Start updating the gRPC connection pool")
+			if ctxt.Kw != nil {
+				t.kw = ctxt.Kw
+			} else {
+				logger.GetLoggerInstance().Warning("The kw field of UpdateEvent Context is nil, only resetting is performed during updates the gRPC Connections pool")
+			}
+			ctxt.Kw = nil
 			cleanConnNum, err := t.resetConnections()
 			if err != nil {
 				logger.GetLoggerInstance().WarningF("Failed to update the gRPC connection pool, unable to clear old connections, %v", err)
 			}
 
 			t.status = define.RunningPoolStatus
-			logger.GetLoggerInstance().InfoF("Completed the update of the gRPC connection pool, cleared %d old connections", cleanConnNum)
+			logger.GetLoggerInstance().DebugF("Completed the update of the gRPC connection pool, cleared %d old connections", cleanConnNum)
 		}
 	}
 
 	timer.Stop()
-	logger.GetLoggerInstance().Debug("Exited periodic check and shrink the gRPC connections of the idle status")
+	logger.GetLoggerInstance().Debug("Exited periodic check and update the gRPC connections")
 }
 
 func (t *ConnectionPool) checkAndUpdateUnpreparedConnections() (retCount int) {
@@ -358,7 +376,7 @@ func (t *ConnectionPool) checkAndUpdateUnpreparedConnections() (retCount int) {
 	return
 }
 
-func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
+func (t *ConnectionPool) checkAndCloseExpiredIdledConnections() (retClosedCount int) {
 	nowTp := time.Now().UnixMilli()
 	var expiredConnList list.List
 
@@ -374,29 +392,23 @@ func (t *ConnectionPool) checkAndShrinkIdledConnections() (retClosedCount int) {
 		}
 	}
 
-	if expiredConnList.Len() <= t.kw.MinIdledConnNum {
-		return
+	var expiredConnsNum int
+	if t.kw.ForceCloseExpiredIdledConns {
+		expiredConnsNum = expiredConnList.Len()
+	} else if expiredConnList.Len() > t.kw.MinReadyConnsNum {
+		expiredConnsNum = expiredConnList.Len() - t.kw.MinReadyConnsNum
 	}
 
 	// Prioritize closing connections at the back of the queue
-	needClosedCount := expiredConnList.Len() - t.kw.MinIdledConnNum
-	var wg sync.WaitGroup
-	wg.Add(needClosedCount)
-
-	for i := 0; i < needClosedCount; i++ {
+	for i := 0; i < expiredConnsNum; i++ {
 		elem := expiredConnList.Back()
 		expiredConnList.Remove(elem)
 		conn := elem.Value.(*Connection)
-		go func(inConn *Connection, inWg *sync.WaitGroup) {
-			defer wg.Done()
-
-			if conn.switchFromIdledToNotOpenUsingStatus() {
-				atomic.AddInt32(&t.idledConnCount, -1)
-				atomic.AddUint64(&closedCount, 1)
-			}
-		}(conn, &wg)
+		if conn.switchFromIdledToNotOpenUsingStatus() {
+			atomic.AddInt32(&t.idledConnCount, -1)
+			closedCount++
+		}
 	}
-	wg.Wait()
 
 	retClosedCount = int(closedCount)
 	return
@@ -496,8 +508,8 @@ func (t *ConnectionPool) resetConnections() (int, error) {
 		return 0, errors.New("there are busy connections that cannot be cleared")
 	}
 
-	var newConnList []*Connection
-	for i := 0; i < t.kw.MinIdledConnNum; i++ {
+	newConnList := []*Connection{}
+	for i := 0; i < t.kw.MinReadyConnsNum; i++ {
 		conn := newConnection(t.kw.Target, t.kw.DialOpts, t.kw.NewConnTimeout)
 		newConnList = append(newConnList, conn)
 	}
@@ -514,16 +526,13 @@ func (t *ConnectionPool) resetConnections() (int, error) {
 	return len(connList), nil
 }
 
-func (t *ConnectionPool) PubUpdateEvent(kw *KwArgsConnPool) error {
-	if kw == nil {
-		return errors.New("invalid keyword args")
-	}
+func (t *ConnectionPool) PubUpdateEvent(ctxt UpdateEventContext) error {
 	if len(t.updateChan) >= MaxUpdateChanCapacity {
 		return define.ErrReachedUpdateChanCapacity
 	}
 
 	t.status = define.UpdatingPoolStatus
-	t.updateChan <- kw
+	t.updateChan <- ctxt
 
 	return nil
 }

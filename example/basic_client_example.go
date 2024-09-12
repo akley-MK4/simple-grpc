@@ -49,9 +49,9 @@ func RunBasicClientExample() error {
 
 	kw.DialOpts = append(kw.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
-	kw.OnAddReadyConnections = func(addedConnsNum int) {
+	kw.OnAddReadyConnections = func(addedConnsNum, currentReadyConnsNum int) {
 		logger.GetLoggerInstance().InfoF("\n\n\nSuccessfully switched %d gRPC connections to the ready state, the current number of ready gRPC connections is %d\n\n\n",
-			addedConnsNum, connPoolInst.GetReadyConnectionsCount())
+			addedConnsNum, currentReadyConnsNum)
 	}
 
 	connPool, newConnPoolErr := connectionpool.NewConnectionPool(kw)

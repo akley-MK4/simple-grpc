@@ -110,7 +110,7 @@ type UpdateEventContext struct {
 	Kw *KwArgsConnPool
 }
 
-type OnAddReadyConnectionsFunc func(addedReadyConnsNum int)
+type OnAddReadyConnectionsFunc func(addedReadyConnsNum, currentReadyConnsNum int)
 
 type ConnectionPool struct {
 	kw *KwArgsConnPool
@@ -325,7 +325,7 @@ loopEnd:
 
 			if retCount := t.checkAndAddReadyConnections(); retCount > 0 {
 				if t.onAddReadyConnections != nil {
-					t.onAddReadyConnections(retCount)
+					t.onAddReadyConnections(retCount, t.GetReadyConnectionsCount())
 				}
 			}
 

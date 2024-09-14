@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
+	"time"
+
 	"github.com/akley-MK4/simple-grpc/define"
 	"github.com/akley-MK4/simple-grpc/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"sync/atomic"
-	"time"
 )
 
 const (
@@ -248,8 +249,11 @@ func (t *Connection) switchFromDisconnectedToBusyUsingStatus() (retChgStatus, sw
 
 	switched = t.checkAndWaitForGRPCConnReady()
 	if !switched {
-		t.usingStatus = define.DisconnectedUsingStatus
 		retChgStatus = false
+		retErr = define.ErrTrcReconnect
+		t.grpcConn.Close()
+		t.grpcConn = nil
+		t.usingStatus = define.NotOpenUsingStatus
 	}
 
 	return

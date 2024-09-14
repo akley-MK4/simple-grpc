@@ -330,7 +330,7 @@ loopEnd:
 			}
 
 			if retCount := t.checkAndCloseExpiredIdledConnections(); retCount > 0 {
-				logger.GetLoggerInstance().DebugF("Closed %d expired gRPC connections", retCount)
+				logger.GetLoggerInstance().DebugF("Closed %d expired gRPC connections with the idled status", retCount)
 			}
 		case <-t.checkCancelCtx.Done():
 			break loopEnd
